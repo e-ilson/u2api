@@ -2,29 +2,11 @@ package handler
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
-	"mime/multipart"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
-
-	"github.com/google/uuid"
-)
-
-// TokenCount 定义了 token 计数的结构
-type TokenCount struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
-	TotalTokens      int `json:"total_tokens"`
-}
-
-const (
-	MaxContextTokens = 2000 // 最大上下文 token 数
 )
 
 // YouChatResponse 定义了从 You.com API 接收的单个 token 的结构。
@@ -152,20 +134,6 @@ func reverseMapModelName(youModel string) string {
 // originalModel 存储原始的 OpenAI 模型名称。
 var originalModel string
 
-// NonceResponse 定义了获取 nonce 的响应结构
-type NonceResponse struct {
-	Uuid string
-}
-
-// UploadResponse 定义了文件上传的响应结构
-type UploadResponse struct {
-	Filename     string `json:"filename"`
-	UserFilename string `json:"user_filename"`
-}
-
-// 定义最大查询长度
-const MaxQueryLength = 2000
-
 // Handler 是处理所有传入 HTTP 请求的主处理函数。
 func Handler(w http.ResponseWriter, r *http.Request) {
 	// 处理 /v1/models 请求（列出可用模型）
@@ -235,184 +203,48 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	originalModel = openAIReq.Model
-
-	// 转换 system 消息为 user 消息
-	openAIReq.Messages = convertSystemToUser(openAIReq.Messages)
+	originalModel = openAIReq.Model                                // 保存原始模型名称
+	lastMessage := openAIReq.Messages[len(openAIReq.Messages)-1].Content // 获取最后一条消息
 
 	// 构建 You.com 聊天历史
 	var chatHistory []map[string]interface{}
-	var sources []map[string]interface{}
-	var lastAssistantMessage string
-
-	// 处理历史消息（不包括最后一条）
-	for _, msg := range openAIReq.Messages[:len(openAIReq.Messages)-1] {
-		if msg.Role == "user" {
-			tokens, err := countTokens([]Message{msg})
-			if err != nil {
-				http.Error(w, "Failed to count tokens", http.StatusInternalServerError)
-				return
-			}
-
-			if tokens > MaxContextTokens {
-				// 获取 nonce
-				nonceResp, err := getNonce(dsToken)
-				if err != nil {
-					fmt.Printf("获取 nonce 失败: %v\n", err)
-					http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
-					return
-				}
-
-				// 创建临时文件
-				tempFile := fmt.Sprintf("temp_%s.txt", nonceResp.Uuid)
-				if err := os.WriteFile(tempFile, []byte(msg.Content), 0644); err != nil {
-					fmt.Printf("创建临时文件失败: %v\n", err)
-					http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-					return
-				}
-				defer os.Remove(tempFile)
-
-				// 上传文件
-				uploadResp, err := uploadFile(dsToken, tempFile)
-				if err != nil {
-					fmt.Printf("上传文件失败: %v\n", err)
-					http.Error(w, "Failed to upload file", http.StatusInternalServerError)
-					return
-				}
-
-				// 添加文件源信息
-				sources = append(sources, map[string]interface{}{
-					"source_type":   "user_file",
-					"filename":      uploadResp.Filename,
-					"user_filename": uploadResp.UserFilename,
-					"size_bytes":    len(msg.Content),
-				})
-
-				// 在历史记录中使用文件引用
-				chatHistory = append(chatHistory, map[string]interface{}{
-					"question": fmt.Sprintf("Please review the attached file: %s", uploadResp.UserFilename),
-					"answer":   "",
-				})
-			} else {
-				chatHistory = append(chatHistory, map[string]interface{}{
-					"question": msg.Content,
-					"answer":   "",
-				})
-			}
-		} else if msg.Role == "assistant" {
-			// 只保存最后一条 assistant 消息
-			lastAssistantMessage = msg.Content
+	for _, msg := range openAIReq.Messages {
+		chatMsg := map[string]interface{}{
+			"question": msg.Content,
+			"answer":   "",
 		}
+		// 如果是 assistant 的消息, 则交换 question 和 answer
+		if msg.Role == "assistant" {
+			chatMsg["question"] = ""
+			chatMsg["answer"] = msg.Content
+		}
+		chatHistory = append(chatHistory, chatMsg)
 	}
 
-	// 如果有最后一条 assistant 消息，添加到历史记录中
-	if lastAssistantMessage != "" {
-		chatHistory = append(chatHistory, map[string]interface{}{
-			"question": "",
-			"answer":   lastAssistantMessage,
-		})
-	}
-
-	chatHistoryJSON, _ := json.Marshal(chatHistory)
+	chatHistoryJSON, _ := json.Marshal(chatHistory) // 将聊天历史序列化为 JSON
 
 	// 创建 You.com API 请求
 	youReq, _ := http.NewRequest("GET", "https://you.com/api/streamingSearch", nil)
 
-	// 生成必要的 ID
-	chatId := uuid.New().String()
-	conversationTurnId := uuid.New().String()
-	traceId := fmt.Sprintf("%s|%s|%s", chatId, conversationTurnId, time.Now().Format(time.RFC3339))
-
-	// 处理最后一条消息
-	lastMessage := openAIReq.Messages[len(openAIReq.Messages)-1]
-	lastMessageTokens, err := countTokens([]Message{lastMessage})
-	if err != nil {
-		http.Error(w, "Failed to count tokens", http.StatusInternalServerError)
-		return
-	}
-
-	// 构建查询参数
+	// 构建 You.com API 查询参数
 	q := youReq.URL.Query()
-
-	// 设置基本参数
+	q.Add("q", lastMessage) // 主要查询参数 (最后一条消息)
 	q.Add("page", "1")
 	q.Add("count", "10")
-	q.Add("safeSearch", "Off")
-	q.Add("mkt", "en-US")
+	q.Add("safeSearch", "Moderate")
+	q.Add("mkt", "zh-HK")             // 地区
 	q.Add("enable_worklow_generation_ux", "true")
 	q.Add("domain", "youchat")
 	q.Add("use_personalization_extraction", "true")
-	q.Add("queryTraceId", chatId)
-	q.Add("chatId", chatId)
-	q.Add("conversationTurnId", conversationTurnId)
-	q.Add("pastChatLength", fmt.Sprintf("%d", len(chatHistory)))
-	q.Add("selectedChatMode", "custom")
-	q.Add("selectedAiModel", mapModelName(openAIReq.Model))
+	q.Add("pastChatLength", fmt.Sprintf("%d", len(chatHistory)-1)) // 过去的聊天记录长度
+	q.Add("selectedChatMode", "custom")                            // 聊天模式
+	q.Add("selectedAiModel", mapModelName(openAIReq.Model))         // 映射后的模型名称
 	q.Add("enable_agent_clarification_questions", "true")
-	q.Add("traceId", traceId)
 	q.Add("use_nested_youchat_updates", "true")
+	q.Add("chat", string(chatHistoryJSON)) // 聊天历史 (JSON 格式)
+	youReq.URL.RawQuery = q.Encode()        // 编码查询参数
 
-	// 如果最后一条消息超过限制，使用文件上传
-	if lastMessageTokens > MaxContextTokens {
-		// 获取 nonce
-		nonceResp, err := getNonce(dsToken)
-		if err != nil {
-			fmt.Printf("获取 nonce 失败: %v\n", err)
-			http.Error(w, "Failed to get nonce", http.StatusInternalServerError)
-			return
-		}
-
-		// 创建临时文件
-		tempFile := fmt.Sprintf("temp_%s.txt", nonceResp.Uuid)
-		if err := os.WriteFile(tempFile, []byte(lastMessage.Content), 0644); err != nil {
-			fmt.Printf("创建临时文件失败: %v\n", err)
-			http.Error(w, "Failed to create temp file", http.StatusInternalServerError)
-			return
-		}
-		defer os.Remove(tempFile)
-
-		// 上传文件
-		uploadResp, err := uploadFile(dsToken, tempFile)
-		if err != nil {
-			fmt.Printf("上传文件失败: %v\n", err)
-			http.Error(w, "Failed to upload file", http.StatusInternalServerError)
-			return
-		}
-
-		// 添加文件源信息
-		sources = append(sources, map[string]interface{}{
-			"source_type":   "user_file",
-			"filename":      uploadResp.Filename,
-			"user_filename": uploadResp.UserFilename,
-			"size_bytes":    len(lastMessage.Content),
-		})
-
-		// 添加 sources 参数
-		sourcesJSON, _ := json.Marshal(sources)
-		q.Add("sources", string(sourcesJSON))
-
-		// 使用文件引用作为查询
-		q.Add("q", fmt.Sprintf("Please review the attached file: %s", uploadResp.UserFilename))
-	} else {
-		// 如果有之前上传的文件，添加 sources
-		if len(sources) > 0 {
-			sourcesJSON, _ := json.Marshal(sources)
-			q.Add("sources", string(sourcesJSON))
-		}
-		q.Add("q", lastMessage.Content)
-	}
-
-	q.Add("chat", string(chatHistoryJSON))
-	youReq.URL.RawQuery = q.Encode()
-
-	fmt.Printf("\n=== 完整请求信息 ===\n")
-	fmt.Printf("请求 URL: %s\n", youReq.URL.String())
-	fmt.Printf("请求头:\n")
-	for key, values := range youReq.Header {
-		fmt.Printf("%s: %v\n", key, values)
-	}
-
-	// 设置请求头
+	// 设置 You.com API 请求头
 	youReq.Header = http.Header{
 		"sec-ch-ua-platform":         {"Windows"},
 		"Cache-Control":              {"no-cache"},
@@ -422,7 +254,7 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		"sec-ch-ua-mobile":           {"?0"},
 		"sec-ch-ua-arch":             {"x86"},
 		"sec-ch-ua-full-version":     {"133.0.3065.39"},
-		"Accept":                     {"text/event-stream"},
+		"Accept":                     {"text/event-stream"}, // 重要：接受 SSE 流
 		"User-Agent":                 {"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"},
 		"sec-ch-ua-platform-version": {"19.0.0"},
 		"Sec-Fetch-Site":             {"same-origin"},
@@ -431,36 +263,13 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		"Host":                       {"you.com"},
 	}
 
-	// 设置 Cookie
+	// 设置 You.com API 请求的 Cookie
 	cookies := getCookies(dsToken)
 	var cookieStrings []string
 	for name, value := range cookies {
 		cookieStrings = append(cookieStrings, fmt.Sprintf("%s=%s", name, value))
 	}
 	youReq.Header.Add("Cookie", strings.Join(cookieStrings, ";"))
-	fmt.Printf("Cookie: %s\n", strings.Join(cookieStrings, ";"))
-	fmt.Printf("===================\n\n")
-
-	// 发送请求并获取响应
-	client := &http.Client{}
-	resp, err := client.Do(youReq)
-	if err != nil {
-		fmt.Printf("发送请求失败: %v\n", err)
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	// 打印响应状态码
-	fmt.Printf("响应状态码: %d\n", resp.StatusCode)
-
-	// 如果状态码不是 200，打印响应内容
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		fmt.Printf("错误响应内容: %s\n", string(body))
-		http.Error(w, fmt.Sprintf("API returned status %d", resp.StatusCode), resp.StatusCode)
-		return
-	}
 
 	// 根据 OpenAI 请求的 stream 参数选择处理函数
 	if !openAIReq.Stream {
@@ -476,7 +285,7 @@ func getCookies(dsToken string) map[string]string {
 	return map[string]string{
 		"guest_has_seen_legal_disclaimer": "true",
 		"youchat_personalization":         "true",
-		"DS":                              dsToken,                // 关键的 DS token
+		"DS":                              dsToken, // 关键的 DS token
 		"you_subscription":                "youpro_standard_year", // 示例订阅信息
 		"youpro_subscription":             "true",
 		"ai_model":                        "deepseek_r1", // 示例 AI 模型
@@ -571,7 +380,7 @@ func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 		line := scanner.Text()
 
 		if strings.HasPrefix(line, "event: youChatToken") {
-			scanner.Scan()         // 读取下一行 (data 行)
+			scanner.Scan()        // 读取下一行 (data 行)
 			data := scanner.Text() // 获取数据行
 
 			var token YouChatResponse
@@ -594,130 +403,13 @@ func handleStreamingResponse(w http.ResponseWriter, youReq *http.Request) {
 				},
 			}
 
-			respBytes, _ := json.Marshal(openAIResp)          // 将响应块序列化为 JSON
-			fmt.Fprintf(w, "data: %s\n\n", string(respBytes)) // 写入响应数据
-			w.(http.Flusher).Flush()                          // 立即刷新输出
+			respBytes, _ := json.Marshal(openAIResp)                       // 将响应块序列化为 JSON
+			fmt.Fprintf(w, "data: %s\n\n", string(respBytes))              // 写入响应数据
+			w.(http.Flusher).Flush()                                     // 立即刷新输出
 		}
 	}
 
-}
-
-// 获取上传文件所需的 nonce
-func getNonce(dsToken string) (*NonceResponse, error) {
-	req, _ := http.NewRequest("GET", "https://you.com/api/get_nonce", nil)
-	req.Header.Set("Cookie", fmt.Sprintf("DS=%s", dsToken))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	// 读取完整的响应内容
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %v", err)
-	}
-
-	// 直接使用响应内容作为 UUID
-	return &NonceResponse{
-		Uuid: strings.TrimSpace(string(body)),
-	}, nil
-}
-
-// 上传文件
-func uploadFile(dsToken, filePath string) (*UploadResponse, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-	part, err := writer.CreateFormFile("file", filepath.Base(filePath))
-	if err != nil {
-		return nil, err
-	}
-
-	if _, err := io.Copy(part, file); err != nil {
-		return nil, err
-	}
-	writer.Close()
-
-	req, _ := http.NewRequest("POST", "https://you.com/api/upload", body)
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("Cookie", fmt.Sprintf("DS=%s", dsToken))
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var uploadResp UploadResponse
-	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return nil, err
-	}
-	return &uploadResp, nil
-}
-
-// 计算消息的 token 数（使用字符估算方法）
-func countTokens(messages []Message) (int, error) {
-	totalTokens := 0
-	for _, msg := range messages {
-		content := msg.Content
-		englishCount := 0
-		chineseCount := 0
-
-		// 遍历每个字符
-		for _, r := range content {
-			if r <= 127 { // ASCII 字符（英文和符号）
-				englishCount++
-			} else { // 非 ASCII 字符（中文等）
-				chineseCount++
-			}
-		}
-
-		// 计算 tokens：英文字符 * 0.3 + 中文字符 * 0.6
-		tokens := int(float64(englishCount)*0.3 + float64(chineseCount)*1)
-
-		// 加上角色名的 token（约 2 个）
-		totalTokens += tokens + 2
-	}
-	return totalTokens, nil
-}
-
-// 将 system 消息转换为第一条 user 消息
-func convertSystemToUser(messages []Message) []Message {
-	if len(messages) == 0 {
-		return messages
-	}
-
-	var systemContent strings.Builder
-	var newMessages []Message
-	var systemFound bool
-
-	// 收集所有 system 消息
-	for _, msg := range messages {
-		if msg.Role == "system" {
-			if systemContent.Len() > 0 {
-				systemContent.WriteString("\n")
-			}
-			systemContent.WriteString(msg.Content)
-			systemFound = true
-		} else {
-			newMessages = append(newMessages, msg)
-		}
-	}
-
-	// 如果有 system 消息，将其作为第一条 user 消息
-	if systemFound {
-		newMessages = append([]Message{{
-			Role:    "user",
-			Content: systemContent.String(),
-		}}, newMessages...)
-	}
-
-	return newMessages
+	// 通常情况下，流式响应不需要在这里处理 scanner.Err()，
+	// 因为连接会保持打开状态，直到客户端关闭或发生错误。
+	// 如果需要处理错误，可以在这里添加，但要确保正确处理连接关闭。
 }
